@@ -9,7 +9,7 @@ python -m venv .venv
 source venv/bin/activate
 ```
 
-4. Install the requirements
+3. Install the requirements
 ```bash
 pip install --upgrade pip
 pip install vitaldb scikit-learn matplotlib pandas numpy
