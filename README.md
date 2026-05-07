@@ -1,6 +1,6 @@
 1. Clone this repository.
 ```bash
-git clone <repository-url>
+git clone https://github.com/v-square007/Continual-Learning-for-Real-Time-ANomaly-Detection-in-Healthcare-Vital-Signs/tree/main
 ```
 
 2. Install the requirements.
