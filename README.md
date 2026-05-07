@@ -1,14 +1,24 @@
-1. Clone this repository.
+1. Clone this repository
 ```bash
 git clone https://github.com/v-square007/Continual-Learning-for-Real-Time-ANomaly-Detection-in-Healthcare-Vital-Signs/tree/main
 ```
 
-2. Install the requirements.
+2. Virtual environment
+   a. Creation of environment
+    ```bash
+    python -m venv .venv
+    ```
+  b. Activation of environment
+    ```bash
+    source venv/bin/activate
+    ```
+
+4. Install the requirements
 ```bash
 !pip install vitaldb scikit-learn matplotlib pandas numpy
 ```
 
-3. run the v7.py file
+4. run the latest v7.py file
 ```bash
 python v7.py
 ```
