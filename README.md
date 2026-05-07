@@ -6,7 +6,7 @@ git clone https://github.com/v-square007/Continual-Learning-for-Real-Time-ANomal
 2. Activate Virtual environment
 ```bash
 python -m venv .venv
-source venv/bin/activate
+source .venv/bin/activate
 ```
 
 3. Install the requirements
