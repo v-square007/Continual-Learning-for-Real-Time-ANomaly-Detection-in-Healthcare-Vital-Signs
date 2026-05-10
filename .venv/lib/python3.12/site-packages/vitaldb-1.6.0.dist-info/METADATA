@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: vitaldb
+Version: 1.6.0
+Summary: VitalDB Python Library
+Author-email: VitalLab <vital@snu.ac.kr>
+License-Expression: MIT
+License-File: LICENSE
+Keywords: healthcare,mcp,medical,vital-signs,vitaldb
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: requests
+Requires-Dist: wfdb
+Provides-Extra: mcp
+Requires-Dist: mcp; extra == 'mcp'
