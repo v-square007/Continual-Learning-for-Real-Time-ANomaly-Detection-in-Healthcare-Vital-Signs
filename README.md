@@ -3,7 +3,17 @@
 git clone https://github.com/v-square007/Continual-Learning-for-Real-Time-ANomaly-Detection-in-Healthcare-Vital-Signs/tree/main
 ```
 
-2. Activate Virtual environment
+2. Virtual environment
+   a. Creation of environment
+    ```bash
+    python -m venv .venv
+    ```
+  b. Activation of environment
+    ```bash
+    source .venv/bin/activate
+    ```
+
+4. Install the requirements
 ```bash
 python -m venv .venv
 source .venv/bin/activate
