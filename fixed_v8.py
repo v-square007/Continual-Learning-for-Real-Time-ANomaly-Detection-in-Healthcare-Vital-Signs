@@ -1,7 +1,7 @@
 """
 =============================================================================
 Continual Learning — Real-Time Anomaly Detection on Healthcare Vital Signals
-Version 8 — Baseline Comparison + Continual Learning + Expanded Evaluation
+v8
 =============================================================================
 
 KEY CHANGES FROM V6:
