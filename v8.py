@@ -2183,24 +2183,64 @@ def main():
     # ── Priority 3: Threshold sensitivity on FULL model (first case) ──────
     print("\n[STEP 4] Threshold sensitivity sweep (Priority 3)…")
     df_sens = pd.DataFrame()
-    if full_per_case and not full_per_case[0]["results"].empty:
-        first_full = full_per_case[0]
+    # Run sweep on the case with most anomalies — gives informative curve
+    sens_case = max(
+        (cd for cd in full_per_case if not cd["results"].empty),
+        key=lambda cd: cd["results"]["is_anomaly"].sum(),
+        default=None
+    )
+    if sens_case is not None:
+        print(f"  Running sensitivity sweep on Case {sens_case['caseid']} "
+              f"({sens_case['results']['is_anomaly'].sum()} anomalies)")
         df_sens = threshold_sensitivity_sweep(
-            first_full["results"],
-            first_full["pipeline"].ifm.warmup_scores,
+            sens_case["results"],
+            sens_case["pipeline"].ifm.warmup_scores,
         )
 
-    # ── Evaluation on FULL model (first case) ─────────────────────────────
-    print("\n[STEP 5] Evaluating FULL model (Case 1)…")
-    eval_results = {}
-    if full_per_case and not full_per_case[0]["results"].empty:
-        first_full_r   = full_per_case[0]["results"]
-        first_full_ifm = full_per_case[0]["pipeline"].ifm
-        first_case_df  = cases[0][1]
-        first_sigs     = cases[0][2]
-        eval_results   = evaluate_model(
-            first_full_r, first_full_ifm, first_case_df, first_sigs
+    # ── Evaluation on FULL model — all cases, aggregate mean±std ─────────
+    print("\n[STEP 5] Evaluating FULL model across all cases…")
+    per_case_eval = []   # list of dicts, one per valid case
+
+    for cd in full_per_case:
+        if cd["results"].empty:
+            continue
+        # Match this case's df_clean and active_sigs from the cases list
+        case_match = next(
+            (c for c in cases if c[0] == cd["caseid"]), None
         )
+        if case_match is None:
+            continue
+        _, df_case, sigs_case = case_match
+        result = evaluate_model(
+            cd["results"], cd["pipeline"].ifm, df_case, sigs_case
+        )
+        if result:
+            result["caseid"] = cd["caseid"]
+            per_case_eval.append(result)
+
+    # Aggregate mean±std across all cases
+    eval_results = {}   # aggregated summary for summary print
+    eval_keys = ["cv", "separation_ratio", "perturbation_sensitivity",
+                 "isolated_fraction"]
+    if per_case_eval:
+        for key in eval_keys:
+            vals = [r[key] for r in per_case_eval if r.get(key) is not None]
+            if vals:
+                eval_results[f"{key}_mean"] = float(np.mean(vals))
+                eval_results[f"{key}_std"]  = float(np.std(vals))
+                eval_results[f"{key}_n"]    = len(vals)
+
+    # Also keep the case with most anomalies for plot_unified_results
+    best_case = max(
+        (cd for cd in full_per_case if not cd["results"].empty),
+        key=lambda cd: cd["results"]["is_anomaly"].sum(),
+        default=None
+    )
+    best_eval = next(
+        (r for r in per_case_eval
+         if best_case and r.get("caseid") == best_case["caseid"]),
+        per_case_eval[0] if per_case_eval else {}
+    )
 
     # ── Plots ─────────────────────────────────────────────────────────────
     print("\n[STEP 6] Generating plots…")
@@ -2210,16 +2250,18 @@ def main():
     plot_cl_novelty_comparison(all_results)         # novelty: static vs adaptive
     if not df_sens.empty:
         plot_threshold_sensitivity(df_sens)
-    if full_per_case and not full_per_case[0]["results"].empty:
-        prefix = "vitaldb_real" if VITALDB_AVAILABLE else "vitaldb_sim"
-        plot_unified_results(
-            full_per_case[0]["results"],
-            cases[0][1],
-            cases[0][2],
-            full_per_case[0]["pipeline"].ifm.threshold,
-            eval_results,
-            prefix=prefix,
-        )
+    if best_case is not None:
+        best_match = next((c for c in cases if c[0] == best_case["caseid"]), None)
+        if best_match:
+            prefix = "vitaldb_real" if VITALDB_AVAILABLE else "vitaldb_sim"
+            plot_unified_results(
+                best_case["results"],
+                best_match[1],
+                best_match[2],
+                best_case["pipeline"].ifm.threshold,
+                best_eval,
+                prefix=prefix,
+            )
 
     # ── Summary ───────────────────────────────────────────────────────────
     print(f"\n{'='*65}")
@@ -2253,12 +2295,41 @@ def main():
           f"/{len(full_per_case)}")
 
     if eval_results:
-        print(f"\nProxy Evaluation (FULL, Case 1):")
+        n_eval = max(
+            eval_results.get(f"{k}_n", 0)
+            for k in ["cv","separation_ratio","perturbation_sensitivity","isolated_fraction"]
+        )
+        print(f"\nProxy Evaluation — FULL model (mean +/- std across {n_eval} cases):")
+        labels = {
+            "cv":                      "CV % (model stability)",
+            "separation_ratio":        "Separation ratio",
+            "perturbation_sensitivity":"Perturbation sensitivity %",
+            "isolated_fraction":       "Isolated fraction %",
+        }
+        scale  = {
+            "cv": 1, "separation_ratio": 1,
+            "perturbation_sensitivity": 1, "isolated_fraction": 100,
+        }
+        good   = {
+            "cv":                      ("< 20%",   lambda v: v < 20),
+            "separation_ratio":        ("> 1.5",   lambda v: v > 1.5),
+            "perturbation_sensitivity":("5-40%",   lambda v: 5 <= v <= 40),
+            "isolated_fraction":       ("< 30%",   lambda v: v < 30),
+        }
+        print(f"  {'Metric':<30s}  {'Mean':>8s}  {'Std':>8s}  {'n':>3s}  {'Target':>8s}  OK?")
+        print("  " + "-"*70)
         for key in ["cv", "separation_ratio", "perturbation_sensitivity",
                     "isolated_fraction"]:
-            val = eval_results.get(key)
-            if val is not None:
-                print(f"  {key:<28s}: {val:.3f}")
+            mu  = eval_results.get(f"{key}_mean")
+            std = eval_results.get(f"{key}_std")
+            n   = eval_results.get(f"{key}_n", 0)
+            if mu is None:
+                continue
+            s   = scale[key]
+            tgt, chk = good[key]
+            ok  = "✔" if chk(mu * s) else "✘"
+            print(f"  {labels[key]:<30s}  {mu*s:>7.2f}  {std*s:>7.2f}  {n:>3d}  "
+                  f"{tgt:>8s}  {ok}")
 
     print(f"\nOutput files:")
     for f in ["baseline_comparison.csv", "baseline_comparison.png",
