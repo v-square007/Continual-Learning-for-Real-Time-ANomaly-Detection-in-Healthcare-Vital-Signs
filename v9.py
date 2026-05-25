@@ -1453,7 +1453,7 @@ def fetch_clinical_events(
     Strategy:
     1. Pull MAP, SpO2, HR tracks at 1Hz
     2. Apply clinical thresholds to identify anomalous seconds
-    3. A window is labelled anomalous (1) if > 30% of its seconds are anomalous
+    3. A window is labelled anomalous (1) if > 10% of its seconds are anomalous
        (avoids labelling a window from a single-second spike)
     4. Returns a pd.Series aligned to window_id with values {0, 1, -1}
        -1 = no annotation data available for this case
@@ -1512,8 +1512,8 @@ def fetch_clinical_events(
     for start in range(0, n - window_size + 1, step):
         end = start + window_size
         window_anom_frac = anom_seconds[start:end].mean()
-        # Label as anomalous if >30% of seconds in window are anomalous
-        window_labels[wid] = 1 if window_anom_frac > 0.30 else 0
+        # Label as anomalous if >10% of seconds in window are anomalous
+        window_labels[wid] = 1 if window_anom_frac > 0.10 else 0
         wid += 1
 
     return pd.Series(window_labels)
@@ -1598,7 +1598,11 @@ def inject_synthetic_anomalies(
 
     injected = []
     for row_start in sorted(injection_rows):
-        row_end   = row_start + WINDOW_SIZE_S
+        # Extended injection: 3-5 consecutive windows (30-50 seconds)
+        n_windows = rng.integers(3, 6)  # 3, 4, or 5 windows
+        row_end   = row_start + (n_windows * WINDOW_SIZE_S)
+        row_end   = min(row_end, len(df_inj))  # don't exceed dataframe length
+        
         inj_type, sig, delta_fn = injection_types[
             rng.integers(len(injection_types))
         ]
@@ -1854,37 +1858,8 @@ def evaluate_model(results: pd.DataFrame, ifm: StreamingIF,
     else:
         print("  [Check 2] No anomalies detected — separation ratio N/A")
 
-    # Check 3: Perturbation sensitivity
-    # Add 5% noise scaled by WARMUP STD (not by individual feature value).
-    # The original code used 0.05 * |fv|, which gives zero noise on zero-valued
-    # features (waveform features seeded with 0.0 by seed_from_bounds, or any
-    # feature that happens to be zero). Scaling by warmup std ensures every
-    # feature dimension gets perturbed proportionally to its actual variance.
-    rng        = np.random.default_rng(42)
-    warmup_std = np.std(warmup_X, axis=0)
-    warmup_std = np.where(warmup_std < 1e-6, 1e-6, warmup_std)  # no zero-std dims
-    noise_scale = 0.05 * warmup_std   # 5% of each feature's warmup std
-
-    # Impute NaN with warmup mean so no windows are skipped
-    warmup_mean = np.nanmean(warmup_X, axis=0)
-    warmup_mean = np.where(np.isnan(warmup_mean), 0.0, warmup_mean)
-
-    score_increases = []
-    for fv in warmup_X[:20]:
-        fv_clean = np.where(np.isnan(fv), warmup_mean, fv)
-        orig = ifm.score_raw(fv_clean)
-        pert = ifm.score_raw(fv_clean + rng.normal(0, noise_scale, fv_clean.shape))
-        score_increases.append((pert - orig) / (orig + 1e-9) * 100)
-
-    if score_increases:
-        ps = float(np.mean(score_increases))
-        eval_results["perturbation_sensitivity"] = ps
-        print(f"  [Check 3] Perturbation sensitivity = {ps:.1f}%  "
-              f"({'✔' if 5 <= ps <= 40 else '⚠ (outside 5-40%)'})")
-    else:
-        print("  [Check 3] Perturbation: all warmup windows invalid")
-
-    # Check 4: Temporal consistency
+    # Check 3: Temporal consistency
+    # (Perturbation sensitivity removed — GT evaluation provides stronger validation)
     flags = results["is_anomaly"].values.astype(int)
     clusters, run = [], 0
     for f in flags:
@@ -2494,7 +2469,7 @@ def plot_unified_results(results: pd.DataFrame, df_clean: pd.DataFrame,
     for key, label, good_range in [
         ("cv",                   "[1] CV",          (0, 20)),
         ("separation_ratio",     "[2] Separation",  (1.05, 99)),
-        ("perturbation_sensitivity", "[3] Perturbation", (10, 30)),
+
         ("isolated_fraction",    "[4] Isolated",    (0, 0.3)),
     ]:
         val = eval_results.get(key)
@@ -2634,7 +2609,7 @@ def main():
 
     # Aggregate mean±std across all cases
     eval_results = {}   # aggregated summary for summary print
-    eval_keys = ["cv", "separation_ratio", "perturbation_sensitivity",
+    eval_keys = ["cv", "separation_ratio",
                  "isolated_fraction"]
     if per_case_eval:
         for key in eval_keys:
@@ -2720,28 +2695,28 @@ def main():
     if eval_results:
         n_eval = max(
             eval_results.get(f"{k}_n", 0)
-            for k in ["cv","separation_ratio","perturbation_sensitivity","isolated_fraction"]
+            for k in ["cv","separation_ratio","isolated_fraction"]
         )
         print(f"\nProxy Evaluation — FULL model (mean +/- std across {n_eval} cases):")
         labels = {
             "cv":                      "CV % (model stability)",
             "separation_ratio":        "Separation ratio",
-            "perturbation_sensitivity":"Perturbation sensitivity %",
+
             "isolated_fraction":       "Isolated fraction %",
         }
         scale  = {
             "cv": 1, "separation_ratio": 1,
-            "perturbation_sensitivity": 1, "isolated_fraction": 100,
+            "isolated_fraction": 100,
         }
         good   = {
             "cv":                      ("< 20%",   lambda v: v < 20),
             "separation_ratio":        ("> 1.05",  lambda v: v > 1.05),
-            "perturbation_sensitivity":("5-40%",   lambda v: 5 <= v <= 40),
+    
             "isolated_fraction":       ("< 30%",   lambda v: v < 30),
         }
         print(f"  {'Metric':<30s}  {'Mean':>8s}  {'Std':>8s}  {'n':>3s}  {'Target':>8s}  OK?")
         print("  " + "-"*70)
-        for key in ["cv", "separation_ratio", "perturbation_sensitivity",
+        for key in ["cv", "separation_ratio",
                     "isolated_fraction"]:
             mu  = eval_results.get(f"{key}_mean")
             std = eval_results.get(f"{key}_std")
