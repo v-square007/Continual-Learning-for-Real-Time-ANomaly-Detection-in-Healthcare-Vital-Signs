@@ -25,7 +25,7 @@ pip install --upgrade pip
 pip install vitaldb scikit-learn matplotlib pandas numpy
 ```
 
-4. run the latest v7.py file
+4. run the latest .py file
 ```bash
-python v7.py
+python <name of file>.py
 ```
