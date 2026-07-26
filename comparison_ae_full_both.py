@@ -1,6 +1,6 @@
 """
 =============================================================================
-Autoencoder Baseline — Comparative Analysis vs Full_Both
+Autoencoder Baseline -- Comparative Analysis vs Full_Both
 =============================================================================
 
 External baseline: windowed FC autoencoder, reconstruction error as anomaly
@@ -8,7 +8,7 @@ score. No MAD warmup (that is our novelty), no drift retraining (that is our
 novelty). Just a plain trained-once AE on random warmup, frozen thereafter.
 
 GT evaluation: clinical annotations only.
-Synthetic injection dropped — we have real labels for all 15 cases.
+Synthetic injection dropped -- we have real labels for all 15 cases.
 
 Metrics:
   Precision, Recall, F1, FPR  (clinical GT)
@@ -41,6 +41,17 @@ try:
     print("[OK] vitaldb imported.")
 except ImportError:
     VITALDB_AVAILABLE = False
+
+# ─────────────────────────────────────────────────────────────
+# REPRODUCIBILITY -- FIX: nothing seeded the AE before. Isolation Forest
+# uses a fixed random seed (per the paper text); the AE baseline needs the
+# exact same guarantee, otherwise weight init + shuffle order change every
+# run and the reported numbers drift run-to-run (this is why the emailed
+# comparison PNG didn't match Table VI).
+# ─────────────────────────────────────────────────────────────
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 # ─────────────────────────────────────────────────────────────
 # CONFIG  (identical to v9)
@@ -80,6 +91,13 @@ MAX_NAN_SIGNAL_FRACTION = 0.50
 QUALITY_DEGRADATION_THRESHOLD = 0.30
 TARGET_CASE_COUNT       = 15
 MIN_CASE_LENGTH         = 500
+
+# FIX: paper text (Section E.2) says warmup windows are drawn from the
+# first 25% of each case. The code previously used 0.50 here, which
+# contradicted the text. Set to match the paper. Change back to 0.50 only
+# if you'd rather edit the paper's wording instead -- pick one, keep them
+# consistent.
+WARMUP_SLICE_FRACTION   = 0.25
 
 AE_EPOCHS    = 50
 AE_BATCH     = 32
@@ -241,17 +259,18 @@ def sliding_windows(df, active_sigs, ws=WINDOW_SIZE_S, step=STEP_SIZE_S):
 
 
 # ─────────────────────────────────────────────────────────────
-# WARMUP — random selection (NOT MAD — that is our novelty)
+# WARMUP -- random selection (NOT MAD -- that is our novelty)
 # ─────────────────────────────────────────────────────────────
 
 def select_warmup_random(df, active_sigs, n_required=WARMUP_WINDOWS):
     """
-    Take first n_required valid windows from the first 50% of data.
-    No stability filtering — the AE baseline gets no benefit of our MAD warmup.
-    NaN features are filled with physiological midpoints so the AE trains on
-    complete vectors (same imputation the scoring loop uses).
+    Take first n_required valid windows from the first
+    WARMUP_SLICE_FRACTION of data. No stability filtering -- the AE baseline
+    gets no benefit of our MAD warmup. NaN features are filled with
+    physiological midpoints so the AE trains on complete vectors (same
+    imputation the scoring loop uses).
     """
-    max_row  = int(len(df) * 0.50)
+    max_row  = int(len(df) * WARMUP_SLICE_FRACTION)
     df_slice = df.iloc[:max_row]
     med_buf  = FeatureMedianBuffer(maxlen=200)
     med_buf.seed_from_bounds(active_sigs)
@@ -284,9 +303,9 @@ def select_warmup_random(df, active_sigs, n_required=WARMUP_WINDOWS):
 
 class VitalAE(nn.Module):
     """
-    Symmetric FC autoencoder: input → 128 → 64 → 32 → 64 → 128 → input.
+    Symmetric FC autoencoder: input -> 128 -> 64 -> 32 -> 64 -> 128 -> input.
     Reconstruction MSE per sample is the anomaly score.
-    No batch norm or dropout — keep it simple for a fair baseline comparison.
+    No batch norm or dropout -- keep it simple for a fair baseline comparison.
     """
     def __init__(self, input_dim, hidden=AE_HIDDEN):
         super().__init__()
@@ -309,7 +328,15 @@ class VitalAE(nn.Module):
 
 def train_ae(X_scaled: np.ndarray, input_dim: int) -> VitalAE:
     X_t     = torch.FloatTensor(X_scaled).to(DEVICE)
-    loader  = DataLoader(TensorDataset(X_t), batch_size=AE_BATCH, shuffle=True)
+
+    # FIX: seeded generator so the shuffle order is reproducible across runs,
+    # matching the "fixed random seed" guarantee already given to Isolation
+    # Forest in the main pipeline.
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    loader = DataLoader(TensorDataset(X_t), batch_size=AE_BATCH,
+                         shuffle=True, generator=g)
+
     model   = VitalAE(input_dim).to(DEVICE)
     opt     = torch.optim.Adam(model.parameters(), lr=AE_LR)
     loss_fn = nn.MSELoss()
@@ -321,7 +348,7 @@ def train_ae(X_scaled: np.ndarray, input_dim: int) -> VitalAE:
             opt.zero_grad()
             loss = loss_fn(model(batch), batch)
             loss.backward()
-            # gradient clipping — prevents NaN from exploding gradients on
+            # gradient clipping -- prevents NaN from exploding gradients on
             # un-normalised vital sign feature vectors
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
@@ -338,19 +365,19 @@ def train_ae(X_scaled: np.ndarray, input_dim: int) -> VitalAE:
 # ─────────────────────────────────────────────────────────────
 
 def run_ae_case(df, active_sigs):
-    # 1. Random warmup — first 25% of case, no stability filter
+    # 1. Random warmup -- first WARMUP_SLICE_FRACTION of case, no stability filter
     warmup_raw = select_warmup_random(df, active_sigs)
     if len(warmup_raw) < WARMUP_WINDOWS:
         print(f"  [AE] Insufficient warmup ({len(warmup_raw)})"); return None
 
-    # 2. Scale — StandardScaler fit only on warmup
+    # 2. Scale -- StandardScaler fit only on warmup
     scaler   = StandardScaler()
     warmup_X = scaler.fit_transform(warmup_raw)
 
-    assert np.isfinite(warmup_X).all(), "NaN/Inf in scaled warmup — check imputation"
+    assert np.isfinite(warmup_X).all(), "NaN/Inf in scaled warmup -- check imputation"
     input_dim = warmup_X.shape[1]
 
-    # 3. Train AE on warmup — record wall-clock time for real-time suitability
+    # 3. Train AE on warmup -- record wall-clock time for real-time suitability
     print(f"  [AE] Training  input_dim={input_dim}, epochs={AE_EPOCHS}")
     t_train_start   = time.perf_counter()
     model           = train_ae(warmup_X, input_dim)
@@ -387,7 +414,7 @@ def run_ae_case(df, active_sigs):
                 val_errors.append(err)
 
     if not val_errors:
-        print("  [AE] No valid validation windows — falling back to warmup errors")
+        print("  [AE] No valid validation windows -- falling back to warmup errors")
         with torch.no_grad():
             wt = torch.FloatTensor(warmup_X).to(DEVICE)
             val_errors = model.recon_error(wt).cpu().numpy().tolist()
@@ -418,7 +445,7 @@ def run_ae_case(df, active_sigs):
             feat_buf.update(fv)
 
             fv_scaled = scaler.transform(fv.reshape(1, -1))
-            # Safety: clip to ±10 std to prevent extreme inputs after drift
+            # Safety: clip to +-10 std to prevent extreme inputs after drift
             fv_scaled = np.clip(fv_scaled, -10, 10)
 
             x_t = torch.FloatTensor(fv_scaled).to(DEVICE)
@@ -511,7 +538,7 @@ def compute_gt_metrics(results, gt_labels, source="clinical"):
 def compute_proxy_metrics(results, warmup_errors, threshold):
     ev = {}
     # CV: bootstrap warmup errors 10 times, measure anomaly rate variance
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(SEED)
     rates = []
     for _ in range(10):
         boot = rng.choice(warmup_errors, size=len(warmup_errors), replace=True)
@@ -519,7 +546,7 @@ def compute_proxy_metrics(results, warmup_errors, threshold):
         rates.append(float((results["decision_score"].values > thr).mean()*100))
     cv = float(np.std(rates)/(np.mean(rates)+1e-9)*100)
     ev["cv"] = cv
-    print(f"  [Check 1] CV = {cv:.1f}%  ({'✔' if cv<20 else '⚠' if cv<40 else '✘'})")
+    print(f"  [Check 1] CV = {cv:.1f}%  ({'PASS' if cv<20 else 'WARN' if cv<40 else 'FAIL'})")
 
     # Separation ratio
     anom_sc = results[results["is_anomaly"]]["decision_score"].values
@@ -527,10 +554,10 @@ def compute_proxy_metrics(results, warmup_errors, threshold):
         sep = float(anom_sc.mean()/(threshold+1e-9))
         ev["separation_ratio"] = sep
         print(f"  [Check 2] Separation ratio = {sep:.3f}  "
-              f"({'✔' if sep>1.05 else '⚠' if sep>1.02 else '✘'})")
+              f"({'PASS' if sep>1.05 else 'WARN' if sep>1.02 else 'FAIL'})")
     else:
         ev["separation_ratio"] = None
-        print("  [Check 2] No anomalies — separation ratio N/A")
+        print("  [Check 2] No anomalies -- separation ratio N/A")
 
     # Isolated fraction
     flags = results["is_anomaly"].values.astype(int)
@@ -546,7 +573,7 @@ def compute_proxy_metrics(results, warmup_errors, threshold):
         ev["mean_cluster_len"]   = float(ca.mean())
         ev["clusters"]           = ca
         print(f"  [Check 4] Isolated fraction = {iso*100:.1f}%  "
-              f"({'✔' if iso<0.3 else '⚠' if iso<0.5 else '✘'})")
+              f"({'PASS' if iso<0.3 else 'WARN' if iso<0.5 else 'FAIL'})")
     else:
         ev["isolated_fraction"] = 0.0
         ev["mean_cluster_len"]  = 0.0
@@ -582,7 +609,7 @@ def compute_operational_metrics(results):
 def plot_comparison(ae_records, fb_ref):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
-        "Autoencoder vs Full_Both (IF + CL) — Comparative Analysis\n"
+        "Autoencoder vs Full_Both (IF + CL) -- Comparative Analysis\n"
         "15 VitalDB surgical cases | Clinical GT labels | Same window pipeline",
         fontsize=12, fontweight="bold"
     )
@@ -645,14 +672,14 @@ def plot_comparison(ae_records, fb_ref):
     ax.bar(x+w/2, fb_inf, w, label="Full_Both",   color="crimson",   alpha=0.8)
     ax.set_xticks(x); ax.set_xticklabels([f"C{c}" for c in cids], fontsize=7)
     ax.set_ylabel("Mean inference time (ms)")
-    ax.set_title("(4) Real-Time Suitability — Per-Window Latency")
+    ax.set_title("(4) Real-Time Suitability -- Per-Window Latency")
     ax.legend(fontsize=8); ax.grid(alpha=0.3, axis="y")
 
     plt.tight_layout()
     out = os.path.join(OUT_DIR, "ae_vs_fullboth_comparison.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"\n[PLOT] ae_vs_fullboth_comparison.png → {out}")
+    print(f"\n[PLOT] ae_vs_fullboth_comparison.png -> {out}")
 
 
 def plot_score_distributions(ae_records):
@@ -678,11 +705,11 @@ def plot_score_distributions(ae_records):
     out = os.path.join(OUT_DIR, "ae_score_distributions.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"[PLOT] ae_score_distributions.png → {out}")
+    print(f"[PLOT] ae_score_distributions.png -> {out}")
 
 
 # ─────────────────────────────────────────────────────────────
-# FULL_BOTH REFERENCE  (from v9 Output.txt)
+# FULL_BOTH REFERENCE  (from v9 Output.txt -- matches paper Tables IV/VI/VII)
 # ─────────────────────────────────────────────────────────────
 
 FULL_BOTH_REF = {
@@ -698,7 +725,6 @@ FULL_BOTH_REF = {
     # AE needs 50 gradient-descent epochs; expected 5-30s depending on hardware.
     "training_time_s":         0.4,
     # Per-case anomaly rates from v9 baseline_comparison summary (Full_Both column)
-    # Approximated from per-case output; exact values run in v9 per-case pipeline
     "per_case_anomaly_rate": {
         1:  0.000, 2:  0.016, 3:  0.435, 4:  0.036,
         5:  0.010, 6:  0.018, 7:  0.028, 8:  0.093,
@@ -714,8 +740,8 @@ FULL_BOTH_REF = {
 
 def main():
     print("="*65)
-    print("  Autoencoder Baseline — Comparative Analysis vs Full_Both")
-    print("  VitalDB | 15 cases | Clinical GT | Random warmup (no MAD)")
+    print("  Autoencoder Baseline -- Comparative Analysis vs Full_Both")
+    print(f"  VitalDB | 15 cases | Clinical GT | Random warmup (no MAD) | seed={SEED}")
     print("="*65)
 
     print("\n[STEP 1] Loading VitalDB cases...")
@@ -727,9 +753,9 @@ def main():
     ae_records = []
 
     for caseid, df_clean, active_sigs in cases:
-        print(f"\n{'─'*55}")
+        print(f"\n{'-'*55}")
         print(f"  Case {caseid}  ({len(df_clean)} rows, {len(active_sigs)} signals)")
-        print(f"{'─'*55}")
+        print(f"{'-'*55}")
 
         out = run_ae_case(df_clean, active_sigs)
         if out is None: continue
@@ -761,7 +787,7 @@ def main():
 
     # ── Summary table ─────────────────────────────────────────
     print("\n" + "="*72)
-    print("  COMPARATIVE SUMMARY — Autoencoder vs Full_Both (IF + CL)")
+    print("  COMPARATIVE SUMMARY -- Autoencoder vs Full_Both (IF + CL)")
     print("="*72)
 
     def agg(key):
@@ -775,16 +801,12 @@ def main():
         ("Clinical Recall",          "clinical_recall",      1,     True),
         ("Clinical F1",              "clinical_f1",          1,     True),
         ("Clinical FPR",             "clinical_fpr",         1,     False),
-        # Anomaly rate: lower is better. Full_Both targets ~5% via IF contamination
-        # prior; AE has no such constraint and fires freely without a calibrated prior.
         ("Anomaly Rate (%)",         "anomaly_rate",         100,   False),
         ("Isolated Fraction (%)",    "isolated_fraction",    100,   False),
         ("Mean Cluster Length",      "mean_cluster_len",     1,     None),
         ("CV %",                     "cv",                   1,     False),
         ("Separation Ratio",         "separation_ratio",     1,     True),
         ("Mean Inf Latency (ms)",    "mean_inf_ms",          1,     False),
-        # Training setup cost per case: IF fits in one call; AE runs 50 epochs.
-        # Matters for real-time deployment where a new case starts every few hours.
         ("Training Time (s/case)",   "training_time_s",      1,     False),
     ]
 
@@ -802,9 +824,9 @@ def main():
         "training_time_s":     FULL_BOTH_REF["training_time_s"],
     }
 
-    print(f"\n  {'Metric':<26s}  {'AE Mean':>10s}  {'AE ±Std':>8s}  "
+    print(f"\n  {'Metric':<26s}  {'AE Mean':>10s}  {'AE +/-Std':>9s}  "
           f"{'n':>3s}  {'Full_Both':>10s}  {'Better':>10s}")
-    print("  " + "─"*75)
+    print("  " + "-"*76)
 
     rows_csv = []
     for label, key, scale, hib in METRICS:
@@ -815,7 +837,7 @@ def main():
         fb_s        = fb  * scale if fb is not None   else float("nan")
 
         if hib is None:
-            winner = "—"
+            winner = "--"
         elif np.isnan(mu_s) or np.isnan(fb_s):
             winner = "N/A"
         else:
@@ -823,7 +845,7 @@ def main():
                                     (not hib and fb_s < mu_s) else "AE"
 
         mu_str  = f"{mu_s:10.3f}" if np.isfinite(mu_s)  else f"{'N/A':>10s}"
-        std_str = f"{std_s:8.3f}" if np.isfinite(std_s) else f"{'N/A':>8s}"
+        std_str = f"{std_s:9.3f}" if np.isfinite(std_s) else f"{'N/A':>9s}"
         fb_str  = f"{fb_s:10.3f}" if np.isfinite(fb_s)  else f"{'N/A':>10s}"
 
         print(f"  {label:<26s}  {mu_str}  {std_str}  {n:>3d}  {fb_str}  {winner:>10s}")
@@ -833,21 +855,23 @@ def main():
     df_csv = pd.DataFrame(rows_csv)
     csv_out = os.path.join(OUT_DIR, "ae_vs_fullboth_metrics.csv")
     df_csv.to_csv(csv_out, index=False)
-    print(f"\n  Saved → {csv_out}")
+    print(f"\n  Saved -> {csv_out}")
 
-    print("\n  NOTE — Anomaly Rate: Full_Both targets ~5% by design via the IF "
-          "contamination prior (CONTAMINATION=0.05). The AE has no equivalent "
-          "prior; its rate of 19.6% reflects uncalibrated threshold sensitivity, "
-          "not genuine detection. High recall at the cost of 3x the FPR is not "
-          "a clinical win.")
+    # FIX: this note used to be a hardcoded "19.6%" string regardless of the
+    # actual run's numbers. Now built from the same aggregate this run just
+    # computed, so it can never silently disagree with the table above.
+    ae_ar_mean = next((r["AE_mean"] for r in rows_csv if r["Metric"] == "Anomaly Rate (%)"), float("nan"))
+    print(f"\n  NOTE -- Anomaly Rate: Full_Both targets ~5% by design via the IF "
+          f"contamination prior (CONTAMINATION=0.05). The AE has no equivalent "
+          f"prior; its rate of {ae_ar_mean:.1f}% in this run reflects uncalibrated "
+          f"threshold sensitivity, not genuine detection. High recall at the cost "
+          f"of a much higher FPR is not a clinical win.")
 
     # ── Per-case breakdown CSV ────────────────────────────────
-    # Shows CV and FPR instability per case, which the mean buries.
-    # Case 5 (CV=52.8%) and Case 13 (CV=28.2%) are the key exhibits.
     print("\n[STEP 4] Writing per-case breakdown...")
     per_case_rows = []
     fb_per_case_fpr = {
-        # From v9 GT clinical output — FPR per case for Full_Both
+        # From v9 GT clinical output -- FPR per case for Full_Both (matches Table VII)
         1:  0.000, 2:  0.009, 3:  0.470, 4:  0.036,
         5:  0.009, 6:  0.015, 7:  0.028, 8:  0.112,
         9:  0.026, 10: 0.000, 11: 0.026, 13: 0.080,
@@ -877,14 +901,13 @@ def main():
     df_percase = pd.DataFrame(per_case_rows)
     percase_out = os.path.join(OUT_DIR, "ae_vs_fullboth_percase.csv")
     df_percase.to_csv(percase_out, index=False)
-    print(f"  Saved → {percase_out}")
+    print(f"  Saved -> {percase_out}")
 
-    # Print it inline too
     print(f"\n  {'Case':>5s}  {'AE AR%':>7s}  {'FB AR%':>7s}  "
           f"{'AE FPR':>7s}  {'FB FPR':>7s}  "
           f"{'AE F1':>6s}  {'FB F1':>6s}  "
           f"{'AE CV%':>7s}  {'AE Train(s)':>11s}")
-    print("  " + "─"*75)
+    print("  " + "-"*76)
     for row in per_case_rows:
         print(f"  {row['Case']:>5d}  "
               f"{row['AE_anomaly_rate_%']:>7.1f}  {row['FB_anomaly_rate_%']:>7.1f}  "
@@ -900,7 +923,7 @@ def main():
     for f in ["ae_vs_fullboth_metrics.csv", "ae_vs_fullboth_percase.csv",
               "ae_vs_fullboth_comparison.png", "ae_score_distributions.png"]:
         p = os.path.join(OUT_DIR, f)
-        print(f"  {'✔' if os.path.exists(p) else '✘'}  {p}")
+        print(f"  {'OK' if os.path.exists(p) else 'MISSING'}  {p}")
     print("="*65)
 
     return ae_records, df_csv

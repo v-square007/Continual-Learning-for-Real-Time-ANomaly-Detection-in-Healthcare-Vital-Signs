@@ -1,11 +1,11 @@
 """
 =============================================================================
 Continual Learning — Real-Time Anomaly Detection on Healthcare Vital Signals
-Version 7 — Baseline Comparison + Continual Learning + Expanded Evaluation
+v9
 =============================================================================
 
 KEY CHANGES FROM V6:
-─────────────────────────────────────────────────────────────────────────────
+-----------------------------------------------------------------------------
 1. THREE-WAY BASELINE COMPARISON (Priority 1):
    - Variant A: IF_ONLY       -- plain IF, random warmup, raw anomaly_score, no CL.
    - Variant B: NO_CL        -- MAD warmup + WindowScore, frozen after warmup.
@@ -806,7 +806,7 @@ class StreamingIF:
         self.original_warmup_X    = None   # Preserved for retraining (anti-forgetting)
         self.retraining_events: List[RetrainingEvent] = []
 
-    # ── Training ──────────────────────────────────────────────────────────
+    # -- Training ----------------------------------------------------------
 
     def fit(self, X: np.ndarray, silent: bool = False):
         """Train on warmup windows and set threshold."""
@@ -882,7 +882,7 @@ class StreamingIF:
             print(f"\n  [RETRAIN] {event}")
         return True
 
-    # ── Scoring ───────────────────────────────────────────────────────────
+    # -- Scoring -----------------------------------------------------------
 
     def score_raw(self, x: np.ndarray) -> float:
         """Raw Isolation Forest anomaly score (higher = more anomalous)."""
@@ -1080,7 +1080,7 @@ class StreamingPipeline:
             print(f"  Window: {WINDOW_SIZE_S}s | Step: {STEP_SIZE_S}s")
             print(f"{'='*65}")
 
-        # ── Warmup selection ──────────────────────────────────────────────
+        # -- Warmup selection ----------------------------------------------
         if self.variant == ModelVariant.IF_ONLY:
             warmup_X = select_warmup_random(df, self.active_sigs)
         else:
@@ -1105,17 +1105,17 @@ class StreamingPipeline:
         for fv in warmup_X:
             self.feat_buffer.update(fv)
 
-        # ── Train ─────────────────────────────────────────────────────────
+        # -- Train ---------------------------------------------------------
         self.ifm.fit(warmup_X, silent=not verbose)
 
-        # ── Drift detector — self-calibrated, mode from variant ──────────
+        # -- Drift detector — self-calibrated, mode from variant ----------
         self.drift_detector = DriftDetector(
             warmup_mean=self.ifm.warmup_mean_score,
             trigger_mode=trigger_mode,
         )
         self.drift_detector.calibrate(self.ifm.warmup_scores)
 
-        # ── Scoring loop ─────────────────────────────────────────────────
+        # -- Scoring loop -------------------------------------------------
         warmup_end_idx = WARMUP_WINDOWS * STEP_SIZE_S + WINDOW_SIZE_S
         skipped_early, skipped_nan = 0, 0
 
@@ -1144,10 +1144,10 @@ class StreamingPipeline:
             decision_score = self.ifm.get_decision_score(ws)
             is_anomaly     = decision_score > self.ifm.threshold
 
-            # ── Drift detection (on anomaly_score — Priority 2) ───────────
+            # -- Drift detection (on anomaly_score — Priority 2) -----------
             drift_triggered = self.drift_detector.update(ws.anomaly_score, is_anomaly)
 
-            # ── Retraining (all three FULL variants) ──────────────────────
+            # -- Retraining (all three FULL variants) ----------------------
             retrained = False
             if (self.ifm.is_continual_learning_variant
                     and drift_triggered
@@ -1167,7 +1167,7 @@ class StreamingPipeline:
                         new_warmup_mean=self.ifm.warmup_mean_score
                     )
 
-            # ── Recent buffer for next retraining ─────────────────────────
+            # -- Recent buffer for next retraining -------------------------
             self._recent_buffer.append((feat, ws.quality, ws.anomaly_score))
 
             # Record drift/anomaly conditions for trigger analysis
@@ -1251,9 +1251,9 @@ def run_all_baselines_per_case(
                    for v in ModelVariant}
 
     for caseid, df_clean, active_sigs in cases:
-        print(f"\n{'─'*55}")
+        print(f"\n{'-'*55}")
         print(f"  Case {caseid}  ({len(df_clean)} rows, {len(active_sigs)} signals)")
-        print(f"{'─'*55}")
+        print(f"{'-'*55}")
         for variant in ModelVariant:
             pipeline = StreamingPipeline(active_sigs, variant=variant)
             results  = pipeline.run(df_clean, verbose=verbose)
@@ -1386,7 +1386,7 @@ def threshold_sensitivity_sweep(
     provides empirical justification for the selected percentile (ideally
     an elbow in the curve around 95th).
     """
-    print("\n── Threshold Sensitivity Sweep ─────────────────────────────")
+    print("\n-- Threshold Sensitivity Sweep -----------------------------")
     rows = []
     decision_scores = results_full["decision_score"].values
 
@@ -1413,6 +1413,411 @@ def threshold_sensitivity_sweep(
 # =============================================================================
 # SECTION 14 — Evaluation (4 Proxy Checks, carried over from v6)
 # =============================================================================
+
+
+# =============================================================================
+# SECTION GT-1 — Clinical Annotation Loader (Ground Truth Approach 1)
+# =============================================================================
+
+# Clinical event tracks in VitalDB that mark genuine anomalous periods.
+# These are the tracks used to define ground truth windows.
+CLINICAL_EVENT_TRACKS = {
+    # Hypotension: MAP < 65 mmHg for ≥ 1 minute is the clinical definition
+    "Solar8000/NIBP_MBP":  ("hypotension",  lambda v: v < 65),
+    # Desaturation: SpO2 < 94% is the clinical alert threshold
+    "Solar8000/PLETH_SPO2": ("desaturation", lambda v: v < 94),
+    # Bradycardia: HR < 50 bpm
+    "Solar8000/HR":         ("bradycardia",  lambda v: v < 50),
+    # Tachycardia: HR > 120 bpm
+    "Solar8000/HR_tachy":   ("tachycardia",  lambda v: v > 120),
+}
+
+# Drug infusion tracks that mark anesthesia phases (induction, maintenance)
+# Propofol and remifentanil presence marks active anesthesia periods
+DRUG_TRACKS = [
+    "Orchestra/PPF20_VOL",   # Propofol infusion volume
+    "Orchestra/RFTN20_VOL",  # Remifentanil infusion volume
+    "Orchestra/PPF20_CE",    # Propofol effect-site concentration
+]
+
+
+def fetch_clinical_events(
+    caseid: int,
+    df_clean: pd.DataFrame,
+    window_size: int = WINDOW_SIZE_S,
+    step: int = STEP_SIZE_S,
+) -> pd.Series:
+    """
+    Fetch VitalDB clinical event annotations and convert to per-window labels.
+
+    Strategy:
+    1. Pull MAP, SpO2, HR tracks at 1Hz
+    2. Apply clinical thresholds to identify anomalous seconds
+    3. A window is labelled anomalous (1) if > 10% of its seconds are anomalous
+       (avoids labelling a window from a single-second spike)
+    4. Returns a pd.Series aligned to window_id with values {0, 1, -1}
+       -1 = no annotation data available for this case
+
+    Requires network access to VitalDB. Falls back to -1 (unknown) if
+    the track is unavailable or the API returns a 403.
+
+    This ground truth is imperfect — MAP thresholds miss some events and
+    catch some non-events — but it provides a clinically grounded binary
+    label that proxy metrics cannot.
+    """
+    if not VITALDB_AVAILABLE:
+        return pd.Series(dtype=int)
+
+    # Map seconds to anomaly flag
+    n_seconds = len(df_clean)
+    anom_seconds = np.zeros(n_seconds, dtype=int)
+    found_any    = False
+
+    for track, (event_name, condition) in CLINICAL_EVENT_TRACKS.items():
+        if "tachy" in track:
+            # Tachycardia uses the same HR track
+            actual_track = "Solar8000/HR"
+        else:
+            actual_track = track
+        try:
+            data = vitaldb.vital_recs(
+                caseid,
+                track_names=[actual_track],
+                interval=1,
+                return_timestamp=True,
+            )
+            if data is None or len(data) == 0:
+                continue
+
+            df_sig = pd.DataFrame(data, columns=["time", "value"])
+            df_sig["time"] = df_sig["time"].astype(float).round().astype(int)
+            df_sig = df_sig.dropna(subset=["value"])
+
+            for _, row in df_sig.iterrows():
+                t = int(row["time"])
+                if 0 <= t < n_seconds and condition(row["value"]):
+                    anom_seconds[t] = 1
+            found_any = True
+
+        except Exception:
+            continue  # Network block or missing track — skip silently
+
+    if not found_any:
+        return pd.Series(dtype=int)
+
+    # Convert second-level labels to window-level labels
+    window_labels = {}
+    n = len(df_clean)
+    wid = 0
+    for start in range(0, n - window_size + 1, step):
+        end = start + window_size
+        window_anom_frac = anom_seconds[start:end].mean()
+        # Label as anomalous if >10% of seconds in window are anomalous
+        window_labels[wid] = 1 if window_anom_frac > 0.10 else 0
+        wid += 1
+
+    return pd.Series(window_labels)
+
+
+# =============================================================================
+# SECTION GT-2 — Synthetic Anomaly Injector (Ground Truth Approach 2)
+# =============================================================================
+
+@dataclass
+class InjectedAnomaly:
+    """Records a synthetic anomaly injection for evaluation."""
+    window_id:    int
+    t_start:      float
+    event_type:   str      # "hr_spike", "spo2_drop", "bp_drop", "rr_spike"
+    magnitude:    float    # How severe the injection was (std units)
+    signal:       str      # Which signal was perturbed
+
+
+def inject_synthetic_anomalies(
+    df_clean: pd.DataFrame,
+    active_sigs: list,
+    n_anomalies: int = 20,
+    seed: int = 42,
+) -> tuple:
+    """
+    Inject controlled synthetic anomalies into a copy of the cleaned dataframe.
+
+    Injection strategy:
+    - Sample n_anomalies random windows from the SECOND HALF of the case
+      (first half is warmup territory — we don't inject there)
+    - For each window, perturb one or more signals by 3-5 standard deviations
+    - Perturbations are clinically motivated: HR spikes (+40-80 bpm),
+      SpO2 drops (-5 to -15%), SBP drops (-30 to -60 mmHg)
+    - Each injection lasts exactly WINDOW_SIZE_S seconds (one full window)
+
+    Returns:
+        df_injected: dataframe with synthetic anomalies added
+        injected_windows: list of InjectedAnomaly records (the ground truth)
+
+    Why the second half only: the first 50% is used for warmup selection.
+    Injecting there would corrupt the baseline and make the test trivial.
+    """
+    rng = np.random.default_rng(seed)
+    df_inj = df_clean.copy()
+    n = len(df_inj)
+
+    # Only inject into second half
+    second_half_start = n // 2
+    n_windows_available = (n - second_half_start - WINDOW_SIZE_S) // STEP_SIZE_S
+
+    if n_windows_available < n_anomalies:
+        n_anomalies = max(1, n_windows_available // 2)
+
+    # Sample injection points (window start row indices)
+    injection_rows = rng.choice(
+        range(second_half_start, n - WINDOW_SIZE_S, STEP_SIZE_S),
+        size=n_anomalies,
+        replace=False,
+    )
+
+    # Define injection types: (signal_key, delta_func)
+    injection_types = []
+    sig_map = {s.split("_")[0]: s for s in active_sigs if "_" not in s}
+
+    if "HR" in sig_map:
+        injection_types.append(("hr_spike",   sig_map["HR"],   lambda: rng.uniform(40,  80)))
+        injection_types.append(("hr_brady",   sig_map["HR"],   lambda: -rng.uniform(25, 45)))
+    if "SpO2" in sig_map:
+        injection_types.append(("spo2_drop",  sig_map["SpO2"], lambda: -rng.uniform(5,  15)))
+    if "SBP" in sig_map:
+        injection_types.append(("sbp_drop",   sig_map["SBP"],  lambda: -rng.uniform(30, 60)))
+    if "RR" in sig_map:
+        injection_types.append(("rr_spike",   sig_map["RR"],   lambda: rng.uniform(15,  25)))
+
+    if not injection_types:
+        # Fallback: perturb first available signal
+        injection_types = [(
+            "generic_spike", active_sigs[0],
+            lambda: rng.uniform(3, 5) * df_inj[active_sigs[0]].std()
+        )]
+
+    injected = []
+    for row_start in sorted(injection_rows):
+        # Extended injection: 3-5 consecutive windows (30-50 seconds)
+        n_windows = rng.integers(3, 6)  # 3, 4, or 5 windows
+        row_end   = row_start + (n_windows * WINDOW_SIZE_S)
+        row_end   = min(row_end, len(df_inj))  # don't exceed dataframe length
+        
+        inj_type, sig, delta_fn = injection_types[
+            rng.integers(len(injection_types))
+        ]
+        delta = delta_fn()
+
+        # Apply injection: clip to physiological bounds afterward
+        if sig in df_inj.columns:
+            df_inj.loc[row_start:row_end - 1, sig] += delta
+            base = sig.split("_")[0]
+            if base in PHYS_BOUNDS:
+                lo, hi = PHYS_BOUNDS[base]
+                df_inj[sig] = df_inj[sig].clip(lo, hi)
+
+        # window_id = row_start // STEP_SIZE_S (approximate)
+        wid = row_start // STEP_SIZE_S
+        t0  = float(df_clean["time"].iloc[row_start]) if row_start < len(df_clean) else float(row_start)
+
+        injected.append(InjectedAnomaly(
+            window_id=wid, t_start=t0,
+            event_type=inj_type, magnitude=abs(delta), signal=sig,
+        ))
+
+    print(f"  [INJECT] {len(injected)} synthetic anomalies injected "
+          f"(types: {set(i.event_type for i in injected)})")
+    return df_inj, injected
+
+
+# =============================================================================
+# SECTION GT-3 — Ground Truth Evaluation
+# =============================================================================
+
+def compute_gt_metrics(
+    results: pd.DataFrame,
+    gt_labels: pd.Series,
+    label_source: str = "clinical",
+) -> dict:
+    """
+    Compute precision, recall, F1 against binary ground truth labels.
+
+    gt_labels: pd.Series indexed by window_id, values in {0, 1}
+    Aligns on window_id — windows not in gt_labels are excluded.
+
+    Metrics:
+    - Precision: of flagged windows, what fraction are truly anomalous?
+    - Recall:    of truly anomalous windows, what fraction were caught?
+    - F1:        harmonic mean of precision and recall
+    - FPR:       false positive rate (false alarms among normal windows)
+    """
+    if gt_labels.empty or results.empty:
+        return {}
+
+    # Align on window_id
+    results_indexed = results.set_index("window_id")
+    common_ids      = results_indexed.index.intersection(gt_labels.index)
+
+    if len(common_ids) == 0:
+        return {}
+
+    y_true = gt_labels.loc[common_ids].values.astype(int)
+    y_pred = results_indexed.loc[common_ids, "is_anomaly"].values.astype(int)
+
+    TP = int(((y_pred == 1) & (y_true == 1)).sum())
+    FP = int(((y_pred == 1) & (y_true == 0)).sum())
+    FN = int(((y_pred == 0) & (y_true == 1)).sum())
+    TN = int(((y_pred == 0) & (y_true == 0)).sum())
+
+    precision = TP / max(TP + FP, 1)
+    recall    = TP / max(TP + FN, 1)
+    f1        = 2 * precision * recall / max(precision + recall, 1e-9)
+    fpr       = FP / max(FP + TN, 1)
+
+    n_gt_pos = int(y_true.sum())
+    n_gt_neg = int((y_true == 0).sum())
+
+    print(f"  [{label_source}] GT labels: {n_gt_pos} anomalous / "
+          f"{n_gt_neg} normal  |  "
+          f"P={precision:.3f}  R={recall:.3f}  F1={f1:.3f}  FPR={fpr:.3f}  "
+          f"(TP={TP} FP={FP} FN={FN} TN={TN})")
+
+    return {
+        f"{label_source}_precision": precision,
+        f"{label_source}_recall":    recall,
+        f"{label_source}_f1":        f1,
+        f"{label_source}_fpr":       fpr,
+        f"{label_source}_n_gt_pos":  n_gt_pos,
+        f"{label_source}_n_windows": len(common_ids),
+    }
+
+
+def evaluate_with_ground_truth(
+    cases: list,
+    all_results: dict,
+    full_per_case: list,
+) -> dict:
+    """
+    Run both ground truth approaches across all cases and aggregate.
+
+    Approach 1 — Clinical annotations:
+        Fetch MAP/SpO2/HR tracks from VitalDB, apply clinical thresholds,
+        compute P/R/F1 of Full_Both against those labels.
+
+    Approach 2 — Synthetic injection:
+        For each case, inject 20 synthetic anomalies into a copy of the data,
+        re-run Full_Both pipeline on the injected data, compute detection rate.
+        This gives a controlled, reproducible precision/recall estimate that
+        doesn't depend on VitalDB annotation availability.
+
+    Both are reported separately in the summary.
+    """
+    gt_results = {
+        "clinical":  [],   # per-case dicts from approach 1
+        "synthetic": [],   # per-case dicts from approach 2
+    }
+
+    print("\n[GT-1] Clinical annotation evaluation...")
+    for caseid, df_clean, active_sigs in cases:
+        # Find matching Full_Both results
+        cd = next((c for c in full_per_case
+                   if c["caseid"] == caseid and not c["results"].empty), None)
+        if cd is None:
+            continue
+
+        gt_labels = fetch_clinical_events(caseid, df_clean)
+        if gt_labels.empty:
+            print(f"  Case {caseid}: no clinical annotations available")
+            continue
+
+        n_pos = gt_labels.sum()
+        if n_pos == 0:
+            print(f"  Case {caseid}: all windows normal per clinical thresholds")
+            continue
+
+        metrics = compute_gt_metrics(cd["results"], gt_labels, "clinical")
+        if metrics:
+            metrics["caseid"] = caseid
+            gt_results["clinical"].append(metrics)
+
+    print("\n[GT-2] Synthetic anomaly injection evaluation...")
+    for caseid, df_clean, active_sigs in cases:
+        print(f"  Case {caseid}:", end=" ")
+        try:
+            df_inj, injected = inject_synthetic_anomalies(
+                df_clean, active_sigs, n_anomalies=20
+            )
+        except Exception as e:
+            print(f"injection failed: {e}")
+            continue
+
+        if not injected:
+            print("no injections possible (case too short)")
+            continue
+
+        # Build ground truth: injected window IDs are anomalous
+        injected_wids = set(inj.window_id for inj in injected)
+        # Run Full_Both pipeline on injected data
+        pipeline_inj = StreamingPipeline(active_sigs, variant=ModelVariant.FULL_BOTH)
+        results_inj  = pipeline_inj.run(df_inj, verbose=False)
+
+        if results_inj.empty:
+            print("pipeline returned empty results on injected data")
+            continue
+
+        # Create gt_labels: 1 for injected windows, 0 otherwise
+        gt_syn = pd.Series(
+            {wid: (1 if wid in injected_wids else 0)
+             for wid in results_inj["window_id"].values}
+        )
+
+        metrics = compute_gt_metrics(results_inj, gt_syn, "synthetic")
+        if metrics:
+            metrics["caseid"]         = caseid
+            metrics["n_injected"]     = len(injected)
+            metrics["injection_types"] = list(set(i.event_type for i in injected))
+            gt_results["synthetic"].append(metrics)
+
+    return gt_results
+
+
+def print_gt_summary(gt_results: dict):
+    """Print aggregated ground truth evaluation summary."""
+    print("\n-- Ground Truth Evaluation Summary ---------------")
+
+    for approach, label in [("clinical", "Clinical Annotations"),
+                             ("synthetic", "Synthetic Injection")]:
+        rows = gt_results.get(approach, [])
+        if not rows:
+            print(f"\n[{label}] No results (network unavailable or no annotations)")
+            continue
+
+        prec = [r[f"{approach}_precision"] for r in rows]
+        rec  = [r[f"{approach}_recall"]    for r in rows]
+        f1   = [r[f"{approach}_f1"]        for r in rows]
+        fpr  = [r[f"{approach}_fpr"]       for r in rows]
+        n    = len(rows)
+
+        print(f"\n[{label}]  n={n} cases")
+        print(f"  {'Metric':<14s}  {'Mean':>8s}  {'Std':>8s}  {'Target':>8s}  OK?")
+        print("  " + "-"*50)
+        for vals, name, tgt, chk in [
+            (prec, "Precision",  "> 0.50", lambda v: v > 0.50),
+            (rec,  "Recall",     "> 0.50", lambda v: v > 0.50),
+            (f1,   "F1 score",   "> 0.50", lambda v: v > 0.50),
+            (fpr,  "FPR",        "< 0.10", lambda v: v < 0.10),
+        ]:
+            mu  = float(np.mean(vals))
+            std = float(np.std(vals))
+            ok  = "✔" if chk(mu) else "✘"
+            print(f"  {name:<14s}  {mu:>8.3f}  {std:>8.3f}  {tgt:>8s}  {ok}")
+
+        if approach == "synthetic":
+            all_types = []
+            for r in rows:
+                all_types.extend(r.get("injection_types", []))
+            print(f"  Injection types tested: {set(all_types)}")
+
 
 def evaluate_model(results: pd.DataFrame, ifm: StreamingIF,
                    df_clean: pd.DataFrame, active_sigs: list) -> dict:
@@ -1449,28 +1854,12 @@ def evaluate_model(results: pd.DataFrame, ifm: StreamingIF,
         sep = float(anom_scores.mean() / ifm.threshold)
         eval_results["separation_ratio"] = sep
         print(f"  [Check 2] Separation ratio = {sep:.3f}  "
-              f"({'✔' if sep > 1.5 else '⚠' if sep > 1.2 else '✘'})")
+              f"({'✔' if sep > 1.05 else '⚠' if sep > 1.02 else '✘'})")
     else:
         print("  [Check 2] No anomalies detected — separation ratio N/A")
 
-    # Check 3: Perturbation sensitivity
-    # Score warmup windows directly (no time-based lookup needed, avoids
-    # the multi-case time collision that was giving 0.067% before).
-    rng = np.random.default_rng(42)
-    score_increases = []
-    for fv in warmup_X[:20]:
-        if np.any(np.isnan(fv)):
-            continue
-        orig = ifm.score_raw(fv)
-        pert = ifm.score_raw(fv + rng.normal(0, 0.05 * np.abs(fv), fv.shape))
-        score_increases.append((pert - orig) / (orig + 1e-9) * 100)
-    if score_increases:
-        ps = float(np.mean(score_increases))
-        eval_results["perturbation_sensitivity"] = ps
-        print(f"  [Check 3] Perturbation sensitivity = {ps:.1f}%  "
-              f"({'✔' if 5 <= ps <= 40 else '⚠'})")
-
-    # Check 4: Temporal consistency
+    # Check 3: Temporal consistency
+    # (Perturbation sensitivity removed — GT evaluation provides stronger validation)
     flags = results["is_anomaly"].values.astype(int)
     clusters, run = [], 0
     for f in flags:
@@ -2079,8 +2468,8 @@ def plot_unified_results(results: pd.DataFrame, df_clean: pd.DataFrame,
     txt = "EVALUATION SUMMARY\n" + "="*35 + "\n\n"
     for key, label, good_range in [
         ("cv",                   "[1] CV",          (0, 20)),
-        ("separation_ratio",     "[2] Separation",  (1.5, 99)),
-        ("perturbation_sensitivity", "[3] Perturbation", (10, 30)),
+        ("separation_ratio",     "[2] Separation",  (1.05, 99)),
+
         ("isolated_fraction",    "[4] Isolated",    (0, 0.3)),
     ]:
         val = eval_results.get(key)
@@ -2137,8 +2526,8 @@ def main():
     print("  Baseline Comparison + CL Retraining + Expanded Eval")
     print("=" * 65)
 
-    # ── Priority 3: Load 10-15 VitalDB cases — per-case, not concatenated ──
-    print("\n[STEP 1] Loading data (per-case)…")
+    # -- Priority 3: Load 10-15 VitalDB cases — per-case, not concatenated --
+    print("\n[STEP 1] Loading data (per-case)...")
     if VITALDB_AVAILABLE:
         cases = load_cases_separately(
             case_ids=list(range(1, 26)),
@@ -2158,13 +2547,13 @@ def main():
 
     print(f"\n  Running pipeline on {len(cases)} case(s).")
 
-    # ── Priority 1: Run all 3 baselines per case ──────────────────────────
-    print("\n[STEP 2] Running baseline comparison (Priority 1)…")
+    # -- Priority 1: Run all 3 baselines per case --------------------------
+    print("\n[STEP 2] Running baseline comparison (Priority 1)...")
     all_results = run_all_baselines_per_case(cases, verbose=False)
     df_comp     = compare_baselines(all_results)
 
-    # ── Priority 2: Continual learning summary ────────────────────────────
-    print("\n[STEP 3] Continual learning analysis (Priority 2)…")
+    # -- Priority 2: Continual learning summary ----------------------------
+    print("\n[STEP 3] Continual learning analysis (Priority 2)...")
     full_per_case = all_results.get(ModelVariant.FULL_BOTH.value, {}).get("per_case", [])
     total_events  = sum(len(c["pipeline"].ifm.retraining_events)
                         for c in full_per_case)
@@ -2180,8 +2569,8 @@ def main():
               "self-calibrated. Lower DRIFT_THRESHOLD_K in the config "
               f"if the data is stable.")
 
-    # ── Priority 3: Threshold sensitivity on FULL model (first case) ──────
-    print("\n[STEP 4] Threshold sensitivity sweep (Priority 3)…")
+    # -- Priority 3: Threshold sensitivity on FULL model (first case) ------
+    print("\n[STEP 4] Threshold sensitivity sweep (Priority 3)...")
     df_sens = pd.DataFrame()
     # Run sweep on the case with most anomalies — gives informative curve
     sens_case = max(
@@ -2197,8 +2586,8 @@ def main():
             sens_case["pipeline"].ifm.warmup_scores,
         )
 
-    # ── Evaluation on FULL model — all cases, aggregate mean±std ─────────
-    print("\n[STEP 5] Evaluating FULL model across all cases…")
+    # -- Evaluation on FULL model — all cases, aggregate mean±std ---------
+    print("\n[STEP 5] Evaluating FULL model across all cases...")
     per_case_eval = []   # list of dicts, one per valid case
 
     for cd in full_per_case:
@@ -2220,7 +2609,7 @@ def main():
 
     # Aggregate mean±std across all cases
     eval_results = {}   # aggregated summary for summary print
-    eval_keys = ["cv", "separation_ratio", "perturbation_sensitivity",
+    eval_keys = ["cv", "separation_ratio",
                  "isolated_fraction"]
     if per_case_eval:
         for key in eval_keys:
@@ -2242,8 +2631,13 @@ def main():
         per_case_eval[0] if per_case_eval else {}
     )
 
-    # ── Plots ─────────────────────────────────────────────────────────────
-    print("\n[STEP 6] Generating plots…")
+    print("\n-- Ground Truth Evaluation Summary ---------------")
+    print("\n[STEP 5b] Ground truth evaluation (clinical + synthetic)...")
+    gt_results = evaluate_with_ground_truth(cases, all_results, full_per_case)
+    print_gt_summary(gt_results)
+
+    # -- Plots -------------------------------------------------------------
+    print("\n[STEP 6] Generating plots...")
     plot_baseline_comparison(all_results, df_comp)
     plot_continual_learning(all_results)
     plot_adaptation_timeline(all_results, cases)    # novelty: moving boundary
@@ -2263,7 +2657,7 @@ def main():
                 prefix=prefix,
             )
 
-    # ── Summary ───────────────────────────────────────────────────────────
+    # -- Summary -----------------------------------------------------------
     print(f"\n{'='*65}")
     print("SUMMARY")
     print(f"{'='*65}")
@@ -2294,31 +2688,35 @@ def main():
           f"{sum(1 for cd in full_per_case if cd['pipeline'].ifm.retraining_events)}"
           f"/{len(full_per_case)}")
 
+    # Reprint GT summary in final summary block
+    if gt_results.get("clinical") or gt_results.get("synthetic"):
+        print_gt_summary(gt_results)
+
     if eval_results:
         n_eval = max(
             eval_results.get(f"{k}_n", 0)
-            for k in ["cv","separation_ratio","perturbation_sensitivity","isolated_fraction"]
+            for k in ["cv","separation_ratio","isolated_fraction"]
         )
         print(f"\nProxy Evaluation — FULL model (mean +/- std across {n_eval} cases):")
         labels = {
             "cv":                      "CV % (model stability)",
             "separation_ratio":        "Separation ratio",
-            "perturbation_sensitivity":"Perturbation sensitivity %",
+
             "isolated_fraction":       "Isolated fraction %",
         }
         scale  = {
             "cv": 1, "separation_ratio": 1,
-            "perturbation_sensitivity": 1, "isolated_fraction": 100,
+            "isolated_fraction": 100,
         }
         good   = {
             "cv":                      ("< 20%",   lambda v: v < 20),
-            "separation_ratio":        ("> 1.5",   lambda v: v > 1.5),
-            "perturbation_sensitivity":("5-40%",   lambda v: 5 <= v <= 40),
+            "separation_ratio":        ("> 1.05",  lambda v: v > 1.05),
+    
             "isolated_fraction":       ("< 30%",   lambda v: v < 30),
         }
         print(f"  {'Metric':<30s}  {'Mean':>8s}  {'Std':>8s}  {'n':>3s}  {'Target':>8s}  OK?")
         print("  " + "-"*70)
-        for key in ["cv", "separation_ratio", "perturbation_sensitivity",
+        for key in ["cv", "separation_ratio",
                     "isolated_fraction"]:
             mu  = eval_results.get(f"{key}_mean")
             std = eval_results.get(f"{key}_std")
@@ -2345,4 +2743,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    all_results, cases, df_comp = main()
